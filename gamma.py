@@ -87,8 +87,8 @@ def prompt():
     print("\n" + "==================")
     print('What would you like to do?')
     action = input("> ")
-    accecptable_actions = ['move', 'go', 'travel', 'walk', 'quit', 'examine', 'inspect', 'interact', 'look']
-    while action.lower() not in accecptable_actions:
+    acceptable_actions = ['move', 'go', 'travel', 'walk', 'quit', 'examine', 'inspect', 'interact', 'look']
+    while action.lower() not in acceptable_actions:
         print("Unknown action, try again.\n")
         action = input("> ")
     if action.lower() == 'quit':
