@@ -1,0 +1,988 @@
+void parse_mobile(File &in, long nr)
+{
+  static long last_seen = -1;
+  if (last_seen == -1) {
+    last_seen = nr;
+  } else if (last_seen >= nr) {
+    snprintf(buf, sizeof(buf), "FATAL ERROR: last_seen %ld >= nr %ld.", last_seen, nr);
+    log(buf);
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+
+  static DBIndex::rnum_t rnum = 0;
+
+  char_data *mob = mob_proto+rnum;
+
+  MOB_VNUM_RNUM(rnum) = nr;
+  mob_index[rnum].number = 0;
+  mob_index[rnum].func = NULL;
+
+  clear_char(mob);
+
+  mob->player_specials = &dummy_mob;
+
+  // heheh....sweeeeet
+  VTable data;
+  data.Parse(&in);
+
+  mob->player.physical_text.keywords =
+    str_dup(data.GetString("Keywords", "mob unnamed"));
+  mob->player.physical_text.name =
+    str_dup(data.GetString("Name", "an unnamed mob"));
+  mob->player.physical_text.room_desc =
+    str_dup(data.GetString("RoomDesc", "An unfinished mob stands here.\n"));
+  mob->player.physical_text.look_desc =
+    str_dup(data.GetString("LookDesc", "He looks pretty unfinished.\n"));
+
+  mob->char_specials.arrive =
+    str_dup(data.GetString("ArriveMsg", "arrives from"));
+  mob->char_specials.leave =
+    str_dup(data.GetString("LeaveMsg", "leaves"));
+
+  {
+    const char *highlight = str_dup(data.GetString("SpeechHighlight", "nothing"));
+    if (!strcmp(highlight, "nothing")) {
+      delete [] highlight;
+    } else {
+      SETTABLE_CHAR_COLOR_HIGHLIGHT(mob) = highlight;
+    }
+  }
+
+  GET_TITLE(mob) = NULL;
+
+  MOB_FLAGS(mob).FromString(data.GetString("MobFlags", "0"));
+  AFF_FLAGS(mob).FromString(data.GetString("AffFlags", "0"));
+
+  GET_RACE(mob) = data.LookupInt("Race", pc_race_types, RACE_HUMAN);
+  GET_SEX(mob) = data.LookupInt("Gender", genders, SEX_NEUTRAL);
+
+  GET_POS(mob) = data.LookupInt("Position", position_types, POS_STANDING);
+  GET_DEFAULT_POS(mob) =
+    data.LookupInt("DefaultPos", position_types, POS_STANDING);
+  mob->mob_specials.attack_type = TYPE_HIT +
+                                  data.LookupInt("AttackType", attack_types, 0);
+
+  GET_REAL_BOD(mob) = data.GetInt("ATTRIBUTES/Bod", 1);
+  GET_REAL_QUI(mob) = data.GetInt("ATTRIBUTES/Qui", 1);
+  GET_REAL_STR(mob) = data.GetInt("ATTRIBUTES/Str", 1);
+  GET_REAL_CHA(mob) = data.GetInt("ATTRIBUTES/Cha", 1);
+  GET_REAL_INT(mob) = data.GetInt("ATTRIBUTES/Int", 1);
+  GET_REAL_WIL(mob) = data.GetInt("ATTRIBUTES/Wil", 1);
+  GET_REAL_REA(mob) = (GET_REAL_QUI(mob) + GET_REAL_INT(mob)) / 2;
+
+
+  mob->real_abils.mag = data.GetInt("ATTRIBUTES/Mag", 0) * 100;
+  mob->real_abils.ess = 600;
+  mob->real_abils.bod_index = 900;
+
+  mob->aff_abils = mob->real_abils;
+
+  GET_HEIGHT(mob) = data.GetInt("POINTS/Height", 100);
+  GET_WEIGHT(mob) = data.GetInt("POINTS/Weight", 5);
+  GET_LEVEL(mob) = data.GetInt("POINTS/Level", 0);
+  GET_MAX_PHYSICAL(mob) = data.GetInt("POINTS/MaxPhys", 10*100);
+  GET_MAX_MENTAL(mob) = data.GetInt("POINTS/MaxMent", 10*100);
+  int innate_ballistic = data.GetInt("POINTS/Ballistic", 0);
+  int innate_impact = data.GetInt("POINTS/Impact", 0);
+  GET_NUYEN_RAW(mob) = data.GetInt("POINTS/Cash", 0);
+  GET_BANK_RAW(mob) = data.GetInt("POINTS/Bank", 0);
+  GET_KARMA(mob) = data.GetInt("POINTS/Karma", 0);
+
+  GET_PHYSICAL(mob) = GET_MAX_PHYSICAL(mob);
+  GET_MENTAL(mob) = GET_MAX_MENTAL(mob);
+  GET_SUSTAINED(mob) = 0;
+  GET_GRADE(mob) = 0;
+
+  /* set pools to 0 initially, affect total will correct them */
+  mob->real_abils.astral_pool = 0;
+  mob->real_abils.defense_pool = 0;
+  mob->real_abils.combat_pool = 0;
+  mob->real_abils.offense_pool = 0;
+  mob->real_abils.hacking_pool = 0;
+  mob->real_abils.magic_pool = 0;
+
+  int j;
+  for (j = 0; j < 10; j++)
+    mob->mob_specials.mob_skills[j] = 0;
+
+  int num_skills = data.NumFields("SKILLS");
+  for (j = 0; j < num_skills; j++) {
+    const char *skill_name = data.GetIndexField("SKILLS", j);
+    int idx;
+
+    for (idx = 0; idx < MAX_SKILLS; idx++)
+      if ((idx == SKILL_UNARMED_COMBAT && !str_cmp("unarmed combat", skill_name)) || !str_cmp(skills[idx].name, skill_name))
+        break;
+    if (idx > 0 || idx < MAX_SKILLS) {
+      SET_SKILL(mob, idx, data.GetIndexInt("SKILLS", j, 0));
+      mob->mob_specials.mob_skills[j * 2] = idx;
+      mob->mob_specials.mob_skills[j * 2 + 1] = data.GetIndexInt("SKILLS", j, 0);
+    }
+  }
+
+  for (j = 0; j < 3; j++)
+    GET_COND(mob, j) = -1;
+
+  for (j = 0; j < NUM_WEARS; j++)
+    mob->equipment[j] = NULL;
+
+  mob->cyberware = NULL;
+  mob->bioware = NULL;
+  mob->nr = rnum;
+  mob->desc = NULL;
+
+  if ( 1 ) {
+    extern int calc_karma(struct char_data *ch, struct char_data *vict);
+
+    int old = GET_KARMA(mob);
+
+    GET_KARMA(mob) = 0; // calc_karma prolly relies on this
+
+    GET_KARMA(mob) = MIN(old, calc_karma(NULL, mob));
+  }
+
+  // Load ammo.
+  for (int wp = START_OF_AMMO_USING_WEAPONS; wp <= END_OF_AMMO_USING_WEAPONS; wp++)
+    for (int am = AMMO_NORMAL; am < NUM_AMMOTYPES; am++) {
+      snprintf(buf, sizeof(buf), "AMMO/%s", get_ammo_representation(wp, am, 0));
+      GET_BULLETPANTS_AMMO_AMOUNT(mob, wp, am) = data.GetInt(buf, 0);
+    }
+
+  // Load cyberware.
+  {
+    char field[32];
+    int num_fields = data.NumSubsections("CYBERWARE");
+    vnum_t vnum;
+    struct obj_data *ware = NULL;
+
+    for (int x = 0; x < num_fields; x++) {
+      const char *name = data.GetIndexSection("CYBERWARE", x);
+      snprintf(field, sizeof(field), "%s/Vnum", name);
+      vnum = data.GetLong(field, -1);
+
+      if (vnum < 1 || !(ware = read_object(vnum, VIRTUAL))) {
+        log_vfprintf("MOB FILE ERROR: Mob %ld referenced cyberware vnum %ld (entry %d) which does not exist.", nr, vnum, x);
+        continue;
+      } else {
+        if (GET_OBJ_TYPE(ware) != ITEM_CYBERWARE) {
+          log_vfprintf("MOB FILE ERROR: Mob %ld referenced vnum %ld (entry %d) as cyberware, but it's not cyberware.", nr, vnum, x);
+          extract_obj(ware);
+          continue;
+        }
+        // log_vfprintf("debug: reading cyber %s (%ld) into prototype for %s.", GET_OBJ_NAME(ware), GET_OBJ_VNUM(ware), GET_CHAR_NAME(mob));
+        obj_to_cyberware(ware, mob);
+      }
+    }
+  }
+
+  // Same thing for bioware. TODO: Merge this copypasta'd code into one function.
+  {
+    char field[32];
+    int num_fields = data.NumSubsections("BIOWARE");
+    vnum_t vnum;
+    struct obj_data *ware = NULL;
+
+    for (int x = 0; x < num_fields; x++) {
+      const char *name = data.GetIndexSection("BIOWARE", x);
+      snprintf(field, sizeof(field), "%s/Vnum", name);
+      vnum = data.GetLong(field, -1);
+
+      if (vnum == -1 || !(ware = read_object(vnum, VIRTUAL))) {
+        log_vfprintf("MOB FILE ERROR: Mob %ld referenced bioware vnum %ld (entry %d) which does not exist.", nr, vnum, x);
+        continue;
+      } else {
+        if (GET_OBJ_TYPE(ware) != ITEM_BIOWARE) {
+          log_vfprintf("MOB FILE ERROR: Mob %ld referenced vnum %ld (entry %d) as bioware, but it's not bioware.", nr, vnum, x);
+          extract_obj(ware);
+          continue;
+        }
+        // log_vfprintf("debug: reading bio %s (%ld) into prototype for %s.", GET_OBJ_NAME(ware), GET_OBJ_VNUM(ware), GET_CHAR_NAME(mob));
+        obj_to_bioware(ware, mob);
+      }
+    }
+  }
+
+  {
+    char field[32];
+    int num_fields = data.NumSubsections("EQUIPMENT"), wearloc;
+    vnum_t vnum;
+    struct obj_data *eq = NULL;
+
+    for (int x = 0; x < num_fields; x++) {
+      const char *name = data.GetIndexSection("EQUIPMENT", x);
+      snprintf(field, sizeof(field), "%s/Vnum", name);
+      vnum = data.GetLong(field, -1);
+      snprintf(field, sizeof(field), "%s/Wearloc", name);
+      wearloc = data.GetLong(field, -1);
+
+      if (!(eq = read_object(vnum, VIRTUAL))) {
+        log_vfprintf("MOB FILE ERROR: Mob %ld referenced equipment vnum %ld (entry %d) which does not exist.", nr, vnum, x);
+        continue;
+      }
+
+      if (wearloc < 0 || wearloc >= NUM_WEARS) {
+        log_vfprintf("MOB FILE ERROR: Mob %ld referenced invalid wearloc %d (entry %d).", nr, wearloc, x);
+        continue;
+      }
+
+      // log_vfprintf("debug: reading eq %s (%ld) into prototype for %s.", GET_OBJ_NAME(eq), GET_OBJ_VNUM(eq), GET_CHAR_NAME(mob));
+      equip_char(mob, eq, wearloc);
+    }
+  }
+
+  // Equipment messed with our armor rating-- make sure our innates are the same.
+  GET_INNATE_BALLISTIC(mob) = innate_ballistic;
+  GET_BALLISTIC(mob) += GET_INNATE_BALLISTIC(mob);
+
+  GET_INNATE_IMPACT(mob) = innate_impact;
+  GET_IMPACT(mob) += GET_INNATE_IMPACT(mob);
+
+  top_of_mobt = rnum++;
+}
+
+void parse_object(File &fl, long nr)
+{
+  static long last_seen = -1;
+  if (last_seen == -1) {
+    last_seen = nr;
+  } else if (last_seen >= nr) {
+    snprintf(buf, sizeof(buf), "FATAL ERROR: last_seen %ld >= nr %ld.", last_seen, nr);
+    log(buf);
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+
+  static DBIndex::rnum_t rnum = 0;
+
+  OBJ_VNUM_RNUM(rnum) = nr;
+  obj_index[rnum].number = 0;
+  obj_index[rnum].func = NULL;
+
+  clear_object(obj_proto + rnum);
+
+  obj_data *obj = obj_proto+rnum;
+
+  obj->in_room = NULL;
+  obj->item_number = rnum;
+
+#ifdef USE_DEBUG_CANARIES
+  obj->canary = CANARY_VALUE;
+#endif
+
+  VTable data;
+  data.Parse(&fl);
+
+  obj->text.keywords = str_dup(data.GetString("Keywords", "item unnamed"));
+  obj->text.name = str_dup(data.GetString("Name", "an unnamed item"));
+  obj->text.room_desc =
+    str_dup(data.GetString("RoomDesc", "An unfinished item is here.\n"));
+  obj->text.look_desc =
+    str_dup(data.GetString("LookDesc", "It looks pretty unfinished.\n"));
+
+  GET_OBJ_TYPE(obj) = data.LookupInt("Type", item_types, ITEM_OTHER);
+  GET_OBJ_WEAR(obj).FromString(data.GetString("WearFlags", "0"));
+  GET_OBJ_EXTRA(obj).FromString(data.GetString("ExtraFlags", "0"));
+  GET_OBJ_AFFECT(obj).FromString(data.GetString("AffFlags", "0"));
+  GET_OBJ_AVAILTN(obj) = data.GetInt("POINTS/AvailTN", 0);
+  GET_OBJ_AVAILDAY(obj) = data.GetFloat("POINTS/AvailDay", 0);
+  GET_LEGAL_NUM(obj) = data.GetInt("POINTS/LegalNum", 0);
+  GET_LEGAL_CODE(obj) = data.GetInt("POINTS/LegalCode", 0);
+  GET_LEGAL_PERMIT(obj) = data.GetInt("POINTS/LegalPermit", 0);
+  GET_OBJ_STREET_INDEX(obj) = data.GetFloat("POINTS/StreetIndex", 0);
+  if (GET_OBJ_TYPE(obj) == ITEM_WEAPON)
+    GET_WEAPON_INTEGRAL_RECOIL_COMP(obj) = data.GetInt("POINTS/InnateRecoilComp", 0);
+  obj->obj_flags.material = data.LookupInt("Material", material_names, 5);
+
+  // No such thing as a negative-weight object.
+  GET_OBJ_WEIGHT(obj) = MAX(0, data.GetFloat("POINTS/Weight", 0));
+  GET_OBJ_BARRIER(obj) = data.GetInt("POINTS/Barrier", 3);
+  GET_OBJ_CONDITION(obj) = GET_OBJ_BARRIER(obj);
+
+  GET_OBJ_COST(obj) = data.GetInt("POINTS/Cost", 0);
+
+  obj->obj_flags.quest_id = 0;
+
+  int i;
+  for (i = 0; i < NUM_VALUES; i++) {
+    char field[32];
+    snprintf(field, sizeof(field), "VALUES/Val%d", i);
+
+    GET_OBJ_VAL(obj, i) = data.GetInt(field, 0);
+  }
+
+  // Set the do-not-touch flags for known templated items.
+  if ((BOTTOM_OF_TEMPLATE_ITEMS <= nr && nr <= TOP_OF_TEMPLATE_ITEMS)
+      || nr == OBJ_BLANK_MAGAZINE || nr ==  OBJ_VEHCONTAINER || nr == OBJ_SHOPCONTAINER) {
+    GET_OBJ_EXTRA(obj).SetBit(ITEM_EXTRA_DONT_TOUCH);
+  }
+
+  // Set !DONATE / !SELL / KEPT on vehicle titles.
+  if (obj_is_a_vehicle_title(obj)) {
+    GET_OBJ_EXTRA(obj).SetBits(ITEM_EXTRA_NODONATE, ITEM_EXTRA_NOSELL, ITEM_EXTRA_KEPT, ENDBIT);
+  }
+
+  { // Per-type modifications and settings.
+    int mult;
+    const char *type_as_string = NULL;
+    switch (GET_OBJ_TYPE(obj)) {
+      case ITEM_DOCWAGON:
+        GET_OBJ_EXTRA(obj).SetBit(ITEM_EXTRA_NODONATE);
+        break;
+      case ITEM_MOD:
+        // Weapon mounts go on all vehicle types.
+        if (GET_VEHICLE_MOD_TYPE(obj) == TYPE_MOUNT) {
+          for (int bit = 0; bit < NUM_VEH_TYPES; bit++) {
+            GET_VEHICLE_MOD_DESIGNED_FOR_FLAGS(obj) |= 1 << bit;
+          }
+          GET_VEHICLE_MOD_LOCATION(obj) = MOD_MOUNT;
+        }
+        break;
+      case ITEM_CHIP:
+        GET_OBJ_VAL(obj, 2) = (GET_OBJ_VAL(obj, 1) * GET_OBJ_VAL(obj, 1)) * 3;
+        GET_OBJ_AVAILTN(obj) = 6;
+        GET_OBJ_AVAILDAY(obj) = 4;
+        if (!skills[GET_OBJ_VAL(obj, 0)].type)
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 100;
+        else if (GET_OBJ_VAL(obj, 0) >= SKILL_ENGLISH) {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 50;
+          GET_OBJ_AVAILDAY(obj) = 1.5;
+        } else {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 150;
+          GET_OBJ_AVAILTN(obj) = 5;
+        }
+        break;
+      case ITEM_DRUG:
+        if (GET_OBJ_DRUG_DOSES(obj) <= 0)
+          GET_OBJ_DRUG_DOSES(obj) = 1;
+        if (GET_OBJ_DRUG_TYPE(obj) < MIN_DRUG || GET_OBJ_DRUG_TYPE(obj) >= NUM_DRUGS) {
+          log_vfprintf("BUILD ERROR: Drug %s had invalid type %d!", GET_OBJ_NAME(obj), GET_OBJ_DRUG_TYPE(obj));
+          GET_OBJ_COST(obj) = 0;
+        } else {
+          GET_OBJ_COST(obj) = GET_OBJ_DRUG_DOSES(obj) * drug_types[GET_OBJ_DRUG_TYPE(obj)].cost;
+          GET_OBJ_STREET_INDEX(obj) = drug_types[GET_OBJ_DRUG_TYPE(obj)].street_idx;
+          GET_OBJ_WEIGHT(obj) = 0.01 * GET_OBJ_DRUG_DOSES(obj);
+        }
+        break;
+      case ITEM_PATCH:
+        switch (GET_PATCH_TYPE(obj)) {
+          case PATCH_ANTIDOTE:
+            // Antidote patches aren't implemented.
+            obj->obj_flags.extra_flags.SetBit(ITEM_EXTRA_NERPS);
+            break;
+          case PATCH_TRAUMA:
+            // Trauma patches are expected to apply the Stabilize flag.
+            obj->obj_flags.bitvector.SetBit(AFF_STABILIZE);
+            // fall through
+          default:
+            // All other patches are implemented, so make sure they're not flagged.
+            obj->obj_flags.extra_flags.RemoveBit(ITEM_EXTRA_NERPS);
+            break;
+        }
+        break;
+      case ITEM_CYBERWARE:
+        price_cyber(obj);
+        obj->obj_flags.wear_flags.SetBit(ITEM_WEAR_TAKE);
+        break;
+      case ITEM_BIOWARE:
+        price_bio(obj);
+        obj->obj_flags.wear_flags.SetBit(ITEM_WEAR_TAKE);
+        break;
+      case ITEM_PROGRAM:
+        if (GET_OBJ_VAL(obj, 0) == SOFT_ATTACK)
+          mult = attack_multiplier[GET_OBJ_VAL(obj, 3) - 1];
+        else
+          mult = programs[GET_OBJ_VAL(obj, 0)].multiplier;
+        GET_OBJ_VAL(obj, 2) = (GET_OBJ_VAL(obj, 1) * GET_OBJ_VAL(obj, 1)) * mult;
+        if (GET_OBJ_VAL(obj, 1) < 4) {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 100;
+          GET_OBJ_AVAILTN(obj) = 2;
+          GET_OBJ_AVAILDAY(obj) = 7;
+        } else if (GET_OBJ_VAL(obj, 1) < 7) {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 200;
+          GET_OBJ_AVAILTN(obj) = 4;
+          GET_OBJ_AVAILDAY(obj) = 7;
+        } else if (GET_OBJ_VAL(obj, 1) < 10) {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 500;
+          GET_OBJ_AVAILTN(obj) = 8;
+          GET_OBJ_AVAILDAY(obj) = 14;
+        } else {
+          GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 2) * 1000;
+          GET_OBJ_AVAILTN(obj) = 16;
+          GET_OBJ_AVAILDAY(obj) = 30;
+        }
+        GET_OBJ_WEIGHT(obj) = 0.02;
+        break;
+      case ITEM_SPELL_FORMULA:
+        GET_OBJ_AVAILTN(obj) = GET_OBJ_VAL(obj, 0);
+        GET_OBJ_COST(obj) = GET_OBJ_VAL(obj, 0);
+        switch (spells[GET_OBJ_VAL(obj, 1)].draindamage) {
+          case LIGHT:
+            GET_OBJ_COST(obj) *= 50;
+            GET_OBJ_AVAILDAY(obj) = 1;
+            break;
+          case MODERATE:
+            GET_OBJ_COST(obj) *= 100;
+            GET_OBJ_AVAILDAY(obj) = 2;
+            break;
+          case SERIOUS:
+            GET_OBJ_COST(obj) *= 500;
+            GET_OBJ_AVAILDAY(obj) = 4;
+            break;
+          case DEADLY:
+          default:
+            GET_OBJ_COST(obj) *= 1000;
+            GET_OBJ_AVAILDAY(obj) = 7;
+            break;
+        }
+        break;
+      case ITEM_GUN_AMMO:
+        // Magic number skip: We don't touch item 121, which is a template.
+        if (GET_OBJ_VNUM(obj) == OBJ_BLANK_AMMOBOX)
+          break;
+
+        // Force all taser ammo to be normal ammo.
+        if (GET_AMMOBOX_WEAPON(obj) == WEAP_TASER) {
+          GET_AMMOBOX_TYPE(obj) = AMMO_NORMAL;
+        }
+
+        if (GET_AMMOBOX_WEAPON(obj) == WEAP_CANNON) {
+          // Assault cannons have special ammo and special rules that aren't reflected in our normal table.
+
+          // Max size 500-- otherwise it's too heavy to carry.
+          GET_AMMOBOX_QUANTITY(obj) = MAX(MIN(GET_AMMOBOX_QUANTITY(obj), 500), 10);
+
+          // Set values according to Assault Cannon ammo (SR3 p281).
+          GET_OBJ_WEIGHT(obj) = (((float) GET_AMMOBOX_QUANTITY(obj)) * 1.25) / 10;
+          GET_OBJ_AVAILDAY(obj) = 3;
+          GET_OBJ_AVAILTN(obj) = 5;
+          GET_OBJ_STREET_INDEX(obj) = 2;
+
+          // Assault Cannon ammo may only ever be explosive (SR3 p279).
+          GET_AMMOBOX_TYPE(obj) = AMMO_EXPLOSIVE;
+        } else {
+          // Max size 1000-- otherwise it's too heavy to carry.
+          GET_AMMOBOX_QUANTITY(obj) = MAX(MIN(GET_AMMOBOX_QUANTITY(obj), 1000), 10);
+
+          // Update weight.
+          GET_OBJ_WEIGHT(obj) = GET_AMMOBOX_QUANTITY(obj) * get_ammo_weight(GET_AMMOBOX_WEAPON(obj), GET_AMMOBOX_TYPE(obj));
+
+          // Set the TNs for this ammo per the default values.
+          GET_OBJ_AVAILDAY(obj) = ammo_type[GET_AMMOBOX_TYPE(obj)].time;
+          GET_OBJ_AVAILTN(obj) = ammo_type[GET_AMMOBOX_TYPE(obj)].tn;
+
+          // Set the street index.
+          GET_OBJ_STREET_INDEX(obj) = ammo_type[GET_AMMOBOX_TYPE(obj)].street_index;
+        }
+
+        // Calculate ammo cost from its quantity, type, and weapon type (this last bit is a house rule).
+        GET_OBJ_COST(obj) = GET_AMMOBOX_QUANTITY(obj) * ammo_type[GET_AMMOBOX_TYPE(obj)].cost * weapon_type_ammo_cost_multipliers[GET_AMMOBOX_WEAPON(obj)];
+
+        // Set the strings-- we want all these things to match for simplicity's sake.
+        type_as_string = get_weapon_ammo_name_as_string(GET_AMMOBOX_WEAPON(obj));
+
+        if (GET_AMMOBOX_WEAPON(obj)) {
+          snprintf(buf, sizeof(buf), "metal ammo ammunition box %s %s %d-%s %s%s",
+                  GET_AMMOBOX_WEAPON(obj) == WEAP_CANNON ? "normal" : ammo_type[GET_AMMOBOX_TYPE(obj)].name,
+                  weapon_types[GET_AMMOBOX_WEAPON(obj)],
+                  GET_AMMOBOX_QUANTITY(obj),
+                  type_as_string,
+                  type_as_string,
+                  GET_AMMOBOX_QUANTITY(obj) > 1 ? "s" : "");
+        } else {
+          strlcpy(buf, "metal ammo ammunition box nondescript", sizeof(buf));
+        }
+        // log_vfprintf("Changing %s to %s for %ld.", obj->text.keywords, buf, nr);
+        DELETE_ARRAY_IF_EXTANT(obj->text.keywords);
+        obj->text.keywords = str_dup(buf);
+
+        if (GET_AMMOBOX_WEAPON(obj)) {
+          snprintf(buf, sizeof(buf), "a %d-%s box of %s %s ammunition",
+                  GET_AMMOBOX_QUANTITY(obj),
+                  type_as_string,
+                  ammo_type[GET_AMMOBOX_TYPE(obj)].name,
+                  weapon_types[GET_AMMOBOX_WEAPON(obj)]);
+        } else {
+          strlcpy(buf, "a nondescript box of ammunition", sizeof(buf));
+        }
+        // log_vfprintf("Changing %s to %s for %ld.", obj->text.name, buf, nr);
+        DELETE_ARRAY_IF_EXTANT(obj->text.name);
+        obj->text.name = str_dup(buf);
+
+
+        if (GET_AMMOBOX_WEAPON(obj)) {
+          snprintf(buf, sizeof(buf), "A metal box of %s %s %s%s has been left here.",
+                  GET_AMMOBOX_WEAPON(obj) == WEAP_CANNON ? "normal" : ammo_type[GET_AMMOBOX_TYPE(obj)].name,
+                  weapon_types[GET_AMMOBOX_WEAPON(obj)],
+                  type_as_string,
+                  GET_AMMOBOX_QUANTITY(obj) > 1 ? "s" : "");
+        } else {
+          strlcpy(buf, "A metal box of ammunition has been left here.", sizeof(buf));
+        }
+        // log_vfprintf("Changing %s to %s for %ld.", obj->text.room_desc, buf, nr);
+        DELETE_ARRAY_IF_EXTANT(obj->text.room_desc);
+        obj->text.room_desc = str_dup(buf);
+
+        // log_vfprintf("Changing %s to %s for %ld.", obj->text.look_desc, buf, nr);
+        DELETE_ARRAY_IF_EXTANT(obj->text.look_desc);
+        obj->text.look_desc = str_dup("A hefty box of ammunition, banded in metal and secured with flip-down hasps for transportation and storage.");
+        break;
+      case ITEM_WEAPON:
+        // Attempt to automatically rectify broken weapons.
+        bool is_melee = FALSE;
+        if (GET_WEAPON_ATTACK_TYPE(obj) > MAX_WEAP)
+          switch (GET_WEAPON_SKILL(obj)) {
+            case SKILL_EDGED_WEAPONS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_EDGED;
+              is_melee = TRUE;
+              break;
+            case SKILL_POLE_ARMS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_POLEARM;
+              is_melee = TRUE;
+              break;
+            case SKILL_WHIPS_FLAILS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_WHIP;
+              is_melee = TRUE;
+              break;
+            case SKILL_CLUBS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_CLUB;
+              is_melee = TRUE;
+              break;
+            case SKILL_UNARMED_COMBAT:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_GLOVE;
+              is_melee = TRUE;
+              break;
+            case SKILL_PISTOLS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_HEAVY_PISTOL;
+              break;
+            case SKILL_RIFLES:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_SPORT_RIFLE;
+              break;
+            case SKILL_SHOTGUNS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_SHOTGUN;
+              break;
+            case SKILL_ASSAULT_RIFLES:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_ASSAULT_RIFLE;
+              break;
+            case SKILL_SMG:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_SMG;
+              break;
+            case SKILL_GRENADE_LAUNCHERS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_GREN_LAUNCHER;
+              break;
+            case SKILL_MISSILE_LAUNCHERS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_MISS_LAUNCHER;
+              break;
+            case SKILL_TASERS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_TASER;
+              break;
+            case SKILL_MACHINE_GUNS:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_LMG;
+              break;
+            case SKILL_ASSAULT_CANNON:
+              GET_WEAPON_ATTACK_TYPE(obj) = WEAP_CANNON;
+              break;
+          }
+
+        if (GET_WEAPON_SKILL(obj) > 100) {
+          log_vfprintf("WARNING: get_weapon_skill for %s is %d. Prior logic would have made it %d.",
+                       GET_OBJ_NAME(obj),
+                       GET_WEAPON_SKILL(obj),
+                       GET_WEAPON_SKILL(obj) - 100);
+          // GET_WEAPON_SKILL(obj) -= 100;
+        }
+
+        if (is_melee)
+          GET_WEAPON_REACH(obj) = MAX(0, GET_WEAPON_REACH(obj));
+
+        break;
+    }
+  } // End per-type modifications.
+
+  // read in affects
+  for (i = 0; i < MAX_OBJ_AFFECT; i++) {
+    char sect[16];
+    snprintf(sect, sizeof(sect), "AFFECT %d", i);
+
+    obj->affected[i].location = APPLY_NONE;
+    obj->affected[i].modifier = 0;
+
+    if (data.NumFields(sect) > 1) {
+      char field[64];
+      snprintf(field, sizeof(field), "%s/Location", sect);
+
+      int loc = data.LookupInt(field, apply_types, APPLY_NONE);
+
+      if (loc == APPLY_NONE) {
+        log_vfprintf("Item #%d's affect #%d had no location -- skipping", nr, i);
+        continue;
+      }
+
+      obj->affected[i].location = loc;
+
+      snprintf(field, sizeof(field), "%s/Modifier", sect);
+      obj->affected[i].modifier = data.GetInt(field, 0);
+    }
+  }
+
+  // Read in source book data, if any.
+  if (data.DoesFieldExist("SourceBook")) {
+    obj->source_info = str_dup(data.GetString("SourceBook", "(none)"));
+  }
+
+  // finally, read in extra descriptions
+  for (i = 0; true; i++) {
+    char sect[16];
+    snprintf(sect, sizeof(sect), "EXTRADESC %d", i);
+
+    if (data.NumFields(sect) > 0) {
+      char field[64];
+
+      snprintf(field, sizeof(field), "%s/Keywords", sect);
+      char *keywords = str_dup(data.GetString(field, NULL));
+
+      if (!keywords) {
+        log_vfprintf("Item #%d's extra description #%d had no keywords -- skipping",
+            nr, i);
+        continue;
+      }
+
+      extra_descr_data *desc = new extra_descr_data;
+      desc->keyword = keywords;
+      snprintf(field, sizeof(field), "%s/Desc", sect);
+      desc->description = str_dup(data.GetString(field, NULL));
+
+      desc->next = obj->ex_description;
+      obj->ex_description = desc;
+    } else
+      break;
+  }
+
+  top_of_objt = rnum++;
+}
+
+void parse_quest(File &fl, long virtual_nr)
+{
+  static long quest_nr = 0;
+  long j, t[20];
+  char line[256];
+
+  memset(t, 0, sizeof(t));
+
+  quest_table[quest_nr].vnum = virtual_nr;
+
+  fl.GetLine(line, 256, FALSE);
+  if (sscanf(line, "%ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+             t, t + 1, t + 2, t + 3, t + 4, t + 5,
+             t + 6, t + 7, t + 8, t + 9, t + 10, t + 11, t+12, t+13, t+14, t+15, t+16) < 12) {
+    fprintf(stderr, "FATAL ERROR: Format error in quest #%ld, expecting 12-15 numbers like '# # # # # # # # # # # #'. Got '%s' instead.\n",
+            virtual_nr, line);
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+  quest_table[quest_nr].johnson = t[0];
+  quest_table[quest_nr].time = t[1];
+  quest_table[quest_nr].min_rep = t[2];
+  quest_table[quest_nr].max_rep = t[3];
+  quest_table[quest_nr].nuyen = t[4];
+  quest_table[quest_nr].karma = t[5];
+  quest_table[quest_nr].reward = (real_object(t[6]) > -1 ? t[6] : -1);
+  quest_table[quest_nr].num_objs = t[7];
+  quest_table[quest_nr].num_mobs = t[8];
+  quest_table[quest_nr].s_time = t[9];
+  quest_table[quest_nr].e_time = t[10];
+  quest_table[quest_nr].s_room = t[11];
+
+  int num_intro_emote = t[12];
+  int num_decline_emote = t[13];
+  int num_quit_emote = t[14];
+  int num_finish_emote = t[15];
+  int num_info_emotes = t[16];
+
+  if (quest_table[quest_nr].num_objs > 0) {
+    quest_table[quest_nr].obj = new quest_om_data[quest_table[quest_nr].num_objs];
+    memset(quest_table[quest_nr].obj, 0, sizeof(quest_om_data) * quest_table[quest_nr].num_objs);
+    for (j = 0; j < quest_table[quest_nr].num_objs; j++) {
+      fl.GetLine(line, 256, FALSE);
+      if (sscanf(line, "%ld %ld %ld %ld %ld %ld %ld %ld", t, t + 1, t + 2, t + 3,
+                 t + 4, t + 5, t + 6, t + 7) != 8) {
+        fprintf(stderr, "FATAL ERROR: Format error in quest #%ld, obj #%ld: expecting 8 numbers like '# # # # # # # #'\n", quest_nr, j);
+        exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+      }
+      quest_table[quest_nr].obj[j].vnum = t[0];
+      quest_table[quest_nr].obj[j].nuyen = t[1];
+      quest_table[quest_nr].obj[j].karma = t[2];
+      quest_table[quest_nr].obj[j].load = (byte) t[3];
+      quest_table[quest_nr].obj[j].objective = (byte) t[4];
+      quest_table[quest_nr].obj[j].l_data = t[5];
+      quest_table[quest_nr].obj[j].l_data2 = t[6];
+      quest_table[quest_nr].obj[j].o_data = t[7];
+    }
+  } else
+    quest_table[quest_nr].obj = NULL;
+
+  if (quest_table[quest_nr].num_mobs > 0) {
+    quest_table[quest_nr].mob = new quest_om_data[quest_table[quest_nr].num_mobs];
+    memset(quest_table[quest_nr].mob, 0, sizeof(quest_om_data) * quest_table[quest_nr].num_mobs);
+    for (j = 0; j < quest_table[quest_nr].num_mobs; j++) {
+      fl.GetLine(line, 256, FALSE);
+      if (sscanf(line, "%ld %ld %ld %ld %ld %ld %ld %ld", t, t + 1, t + 2, t + 3,
+                 t + 4, t + 5, t + 6, t + 7) != 8) {
+        fprintf(stderr, "FATAL ERROR: Format error in quest #%ld, mob #%ld: expecting 8 numbers like '# # # # # # # #'\n", quest_nr, j);
+        exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+      }
+      quest_table[quest_nr].mob[j].vnum = t[0];
+      quest_table[quest_nr].mob[j].nuyen = t[1];
+      quest_table[quest_nr].mob[j].karma = t[2];
+      quest_table[quest_nr].mob[j].load = (byte) t[3];
+      quest_table[quest_nr].mob[j].objective = (byte) t[4];
+      quest_table[quest_nr].mob[j].l_data = t[5];
+      quest_table[quest_nr].mob[j].l_data2 = t[6];
+      quest_table[quest_nr].mob[j].o_data = t[7];
+    }
+  } else {
+    quest_table[quest_nr].mob = NULL;
+  }
+
+  #define READ_EMOTES(type)                                                               \
+  if (num_ ## type ## _emotes > 0) {                                                      \
+    quest_table[quest_nr]. type ## _emotes = new emote_vector_t;                          \
+    while (num_ ## type ## _emotes-- > 0) {                                               \
+      quest_table[quest_nr]. type ## _emotes->push_back(fl.ReadString("##type##_emote")); \
+    }                                                                                     \
+  }
+
+  if (num_intro_emote > 0) {
+    quest_table[quest_nr].intro_emote = fl.ReadString("intro_emote");
+  }
+  if (num_decline_emote > 0) {
+    quest_table[quest_nr].decline_emote = fl.ReadString("decline_emote");
+  }
+  if (num_quit_emote > 0) {
+    quest_table[quest_nr].quit_emote = fl.ReadString("quit_emote");
+  }
+  if (num_finish_emote > 0) {
+    quest_table[quest_nr].finish_emote = fl.ReadString("finish_emote");
+  }
+
+  READ_EMOTES(info);
+
+  #undef READ_EMOTES
+
+  quest_table[quest_nr].intro = fl.ReadString("intro");
+  quest_table[quest_nr].decline = fl.ReadString("decline");
+  quest_table[quest_nr].quit = fl.ReadString("quit");
+  quest_table[quest_nr].finish = fl.ReadString("finish");
+  quest_table[quest_nr].info = fl.ReadString("info");
+  quest_table[quest_nr].s_string = fl.ReadString("s_string");
+  quest_table[quest_nr].e_string = fl.ReadString("e_string");
+  quest_table[quest_nr].done = fl.ReadString("done");
+
+  /* Alright, here's the situation. I was going to add in a location field for
+     the quests, which would show up in the recap and help newbies out... BUT.
+     Turns out we use a shit-tacular file format that's literally just 'crap out
+     strings into a file and require that they exist, no defaulting allowed, or
+     you can't load any quests and the game dies'. Gotta love that jank-ass code.
+     This feature is disabled until someone transitions all the quests into an
+     actually sensible file format. -- LS */
+#ifdef USE_QUEST_LOCATION_CODE
+  quest_table[quest_nr].location = NULL; //fl.ReadString("location");
+#endif
+
+  top_of_questt = quest_nr++;
+}
+
+void parse_shop(File &fl, long virtual_nr)
+{
+  static long last_seen = -1;
+  if (last_seen == -1) {
+    last_seen = virtual_nr;
+  } else if (last_seen >= virtual_nr) {
+    snprintf(buf, sizeof(buf), "FATAL ERROR: last_seen %ld >= virtual_nr %ld.", last_seen, virtual_nr);
+    log(buf);
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+
+  static DBIndex::rnum_t rnum = 0, zone = 0;
+  char field[64];
+  if (virtual_nr <= (zone ? zone_table[zone - 1].top : -1)) {
+    log_vfprintf("FATAL ERROR: Shop #%d is below zone %d.\n", virtual_nr, zone_table[zone].number);
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+  while (virtual_nr > zone_table[zone].top)
+    if (++zone > top_of_zone_table) {
+      log_vfprintf("FATAL ERROR: Shop %d is outside of any zone.\n", virtual_nr);
+      exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+    }
+  shop_data *shop = shop_table+rnum;
+  shop->vnum = virtual_nr;
+  VTable data;
+  data.Parse(&fl);
+
+  shop->keeper = data.GetInt("Keeper", -1);
+  shop->profit_buy = data.GetFloat("ProfitBuy", 0);
+  shop->profit_sell = data.GetFloat("ProfitSell", 0);
+  shop->random_amount = data.GetInt("Random", 0);
+  shop->open = data.GetInt("Open", 0);
+  shop->close = data.GetInt("Close", 24);
+  shop->type = data.LookupInt("Type", shop_type, SHOP_GREY);
+  shop->no_such_itemk = str_dup(data.GetString("NoSuchItemKeeper", "I don't have that."));
+  shop->no_such_itemp = str_dup(data.GetString("NoSuchItemPlayer", "You don't have that."));
+  shop->not_enough_nuyen = str_dup(data.GetString("NoNuyen", "You don't have enough nuyen."));
+  shop->doesnt_buy = str_dup(data.GetString("DoesntBuy", "I don't buy that."));
+  shop->buy = str_dup(data.GetString("Buy", "That'll be %d nuyen."));
+  shop->sell = str_dup(data.GetString("Sell", "Here, %d nuyen."));
+  shop->shopname = str_dup(data.GetString("Name", "Unnamed Shop"));
+  shop->flags.FromString(data.GetString("Flags", "0"));
+  shop->races.FromString(data.GetString("Races", "0"));
+  shop->buytypes.FromString(data.GetString("BuyTypes", "0"));
+  shop->etiquette = data.GetInt("Etiquette", SKILL_STREET_ETIQUETTE);
+  int num_fields = data.NumSubsections("SELLING"), vnum;
+  struct shop_sell_data *templist = NULL;
+
+  // Cap the shop multipliers.
+  if (shop->flags.IsSet(SHOP_CHARGEN)) {
+    shop->profit_buy = 1.0;
+    shop->profit_sell = 1.0;
+  } else {
+    // It should be impossible to set a buy price lower than 1.0.
+    shop->profit_buy = MAX(1.0, shop->profit_buy);
+
+    // Standardize doc cyberware buy prices.
+    if (shop->flags.IsSet(SHOP_DOCTOR)) {
+      shop->profit_sell = CYBERDOC_MAXIMUM_SELL_TO_SHOPKEEP_MULTIPLIER;
+    }
+  }
+
+  // snprintf(buf3, sizeof(buf3), "Parsing shop items for shop %ld (%d found).", virtual_nr, num_fields);
+  for (int x = 0; x < num_fields; x++) {
+    const char *name = data.GetIndexSection("SELLING", x);
+    snprintf(field, sizeof(field), "%s/Vnum", name);
+    vnum = data.GetLong(field, 0);
+    // snprintf(ENDOF(buf3), sizeof(buf3) - strlen(buf3), "\r\n - %s (%d)", name, vnum);
+    if (real_object(vnum) < 1) {
+      // snprintf(ENDOF(buf3), sizeof(buf3) - strlen(buf3), " - nonexistant! Skipping.");
+      continue;
+    }
+    shop_sell_data *sell = new shop_sell_data;
+    sell->vnum = vnum;
+    snprintf(field, sizeof(field), "%s/Type", name);
+    sell->type = data.LookupInt(field, selling_type, SELL_ALWAYS);
+    snprintf(field, sizeof(field), "%s/Stock", name);
+    sell->stock = data.GetInt(field, 0);
+    if (!templist)
+      templist = sell;
+    else
+      for (struct shop_sell_data *temp = templist;; temp = temp->next)
+        if (temp->next == NULL) {
+          temp->next = sell;
+          break;
+        }
+    // snprintf(ENDOF(buf3), sizeof(buf3) - strlen(buf3), ": type %d, stock %d.", sell->type, sell->stock);
+  }
+  // mudlog(buf3, NULL, LOG_SYSLOG, TRUE);
+  shop->selling = templist;
+  top_of_shopt = rnum++;
+}
+
+#define Z       zone_table[zone]
+
+/* load the zone table and command tables */
+void load_zones(File &fl)
+{
+  static int zone = 0;
+  int cmd_no = 0, tmp, error;
+  char *ptr, buf[256];
+
+  Z.num_cmds = 0;
+  while (fl.GetLine(buf, 256, FALSE) && *buf != '$')
+    Z.num_cmds++;
+
+  // subtract the first 4 lines
+  Z.num_cmds -= 4;
+
+  fl.Rewind();
+
+  if (Z.num_cmds == 0)
+    Z.cmd = NULL;
+  else {
+    Z.cmd = new struct reset_com[Z.num_cmds];
+    memset(Z.cmd, 0, sizeof(reset_com) * Z.num_cmds);
+  }
+
+  fl.GetLine(buf, 256, FALSE);
+
+  if (sscanf(buf, "#%d", &Z.number) != 1) {
+    fprintf(stderr, "FATAL ERROR: Format error in %s, line %d: Expected '#' followed by a number.\n",
+            fl.Filename(), fl.LineNumber());
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+  fl.GetLine(buf, 256, FALSE);
+  if ((ptr = strchr(buf, '~')) != NULL)   /* take off the '~' if it's there */
+    *ptr = '\0';
+  Z.name = str_dup(buf);
+
+  fl.GetLine(buf, 256, FALSE);
+  // Attempt to read the new PGHQ flag from the line.
+  if (sscanf(buf, " %d %d %d %d %d %d %d",
+             &Z.top, &Z.lifespan, &Z.reset_mode,
+             &Z.security, &Z.connected, &Z.jurisdiction, &Z.is_pghq) < 6)
+  {
+    // Fallback: Instead, read out the old format. Assume we'll save PGHQ data later.
+    if (sscanf(buf, " %d %d %d %d %d %d",
+               &Z.top, &Z.lifespan, &Z.reset_mode,
+               &Z.security, &Z.connected, &Z.jurisdiction) < 5) {
+      fprintf(stderr, "FATAL ERROR: Format error in 6-constant line of %s: Expected six numbers like ' # # # # # #'.", fl.Filename());
+      exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+    }
+  }
+
+  fl.GetLine(buf, 256, FALSE);
+  // This next section reads in the id nums of the players that can edit
+  // this zone.
+  if (sscanf(buf, "%d %d %d %d %d", &Z.editor_ids[0], &Z.editor_ids[1],
+             &Z.editor_ids[2], &Z.editor_ids[3], &Z.editor_ids[4]) != NUM_ZONE_EDITOR_IDS) {
+    fprintf(stderr, "FATAL ERROR: Format error in editor id list of %s: Expected five numbers like '# # # # #'", fl.Filename());
+    exit(ERROR_WORLD_BOOT_FORMAT_ERROR);
+  }
+
+  cmd_no = 0;
+
+  while (cmd_no < Z.num_cmds) {
+    if (!fl.GetLine(buf, 256, FALSE)) {
+      fprintf(stderr, "Format error in %s - premature end of file\n",
+              fl.Filename());
+      exit(ERROR_ZONEREAD_PREMATURE_EOF);
+    }
+
+    ptr = buf;
+    skip_spaces(&ptr);
+
+    if ((ZCMD.command = *ptr) == '*')
+      continue;
+
+    ptr++;
+
+    error = 0;
+    if (strchr("MVOENPDHL", ZCMD.command) == NULL) { /* a 3-arg command */
+      if (sscanf(ptr, " %d %ld %ld ", &tmp, &ZCMD.arg1, &ZCMD.arg2) != 3)
+        error = 1;
+    } else {
+      if (sscanf(ptr, " %d %ld %ld %ld ", &tmp, &ZCMD.arg1, &ZCMD.arg2, &ZCMD.arg3) != 4)
+        error = 1;
+    }
+
+    ZCMD.if_flag = tmp;
+
+    if (error) {
+      fprintf(stderr, "FATAL ERROR: Format error in %s, line %d: '%s'\n",
+              fl.Filename(), fl.LineNumber(), buf);
+      exit(ERROR_ZONEREAD_FORMAT_ERROR);
+    }
+    if (ZCMD.command == 'L') {
+      ZCMD.command = 'E';
+    }
+    ZCMD.line = fl.LineNumber();
+    cmd_no++;
+  }
+  top_of_zone_table = zone++;
+}
+
+#undef Z
